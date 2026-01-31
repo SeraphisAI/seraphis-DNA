@@ -1,0 +1,110 @@
+{
+  "schema": "katopu.batchrun.v1",
+  "rows": [
+    {
+      "intent": "ilk 5 baz sil",
+      "ok": true,
+      "source": "api:/nl/spec+/edit/apply",
+      "error": null,
+      "result": {
+        "schema": "katopu.result.v1",
+        "before": "ATGACCTTGGCTAACCTGTTACGATGGCCTTAA",
+        "after": "CTTGGCTAACCTGTTACGATGGCCTTAA",
+        "edit_map": "pdel:first 5",
+        "effect_label": "DELETION",
+        "errors": [],
+        "flags": [],
+        "metrics": {
+          "delta_nt": -5,
+          "delta_ops": 1,
+          "runtime_ms": 2,
+          "runtime_breakdown_ms": {
+            "total": 2
+          }
+        },
+        "_meta": {
+          "contract": "katopu.ucp.ultra.final.v1",
+          "engine": "ucp_ultra_core_v1",
+          "source": "api",
+          "spec_version": "1.0.0",
+          "request_id": "e9eea431-d9dc-4c4f-b115-261a886ce217"
+        },
+        "_policy": {
+          "allowed": true,
+          "reason": "",
+          "audit_id": "ec9d3db44c0640059a231d2df20ca324"
+        }
+      }
+    },
+    {
+      "intent": "son 2 baz sil",
+      "ok": true,
+      "source": "api:/nl/spec+/edit/apply",
+      "error": null,
+      "result": {
+        "schema": "katopu.result.v1",
+        "before": "ATGACCTTGGCTAACCTGTTACGATGGCCTTAA",
+        "after": "ATGACCTTGGCTAACCTGTTACGATGGCCTT",
+        "edit_map": "sdel:last 2",
+        "effect_label": "DELETION",
+        "errors": [],
+        "flags": [],
+        "metrics": {
+          "delta_nt": -2,
+          "delta_ops": 1,
+          "runtime_ms": 1,
+          "runtime_breakdown_ms": {
+            "total": 1
+          }
+        },
+        "_meta": {
+          "contract": "katopu.ucp.ultra.final.v1",
+          "engine": "ucp_ultra_core_v1",
+          "source": "api",
+          "spec_version": "1.0.0",
+          "request_id": "daf6cb54-153d-4f1c-b831-02082f726729"
+        },
+        "_policy": {
+          "allowed": true,
+          "reason": "",
+          "audit_id": "007024010c534dfea9cd28346f29a2e0"
+        }
+      }
+    },
+    {
+      "intent": "ilk 0 baz sil",
+      "ok": true,
+      "source": "api:/nl/spec+/edit/apply",
+      "error": null,
+      "result": {
+        "schema": "katopu.result.v1",
+        "before": "ATGACCTTGGCTAACCTGTTACGATGGCCTTAA",
+        "after": "ATGACCTTGGCTAACCTGTTACGATGGCCTTAA",
+        "edit_map": "pdel:first 0",
+        "effect_label": "NOOP",
+        "errors": [],
+        "flags": [],
+        "metrics": {
+          "delta_nt": 0,
+          "delta_ops": 0,
+          "runtime_ms": 1,
+          "runtime_breakdown_ms": {
+            "total": 1
+          }
+        },
+        "_meta": {
+          "contract": "katopu.ucp.ultra.final.v1",
+          "engine": "ucp_ultra_core_v1",
+          "source": "api",
+          "spec_version": "1.0.0",
+          "request_id": "888999e7-04d9-4ade-ac31-f79c42c9b693"
+        },
+        "_policy": {
+          "allowed": true,
+          "reason": "",
+          "audit_id": "ca410b67605f4802b7b80477f1c57008"
+        }
+      }
+    }
+  ]
+}
