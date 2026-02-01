@@ -1,0 +1,11 @@
+CONTRACT_VERSION = "katopu.ucp.ultra.final.v1"
+ENGINE_VERSION = "ucp_ultra_core_v1"
+SPEC_VERSION = "1.0.0"
+
+UNIFIED_SCHEMA_ID = "katopu.unified.schema.v1"
+MANIFEST_SCHEMA_ID = "katopu.manifest.v1"
+EDITOP_SCHEMA_ID = "katopu.editop.v2"
+EDITSPEC_SCHEMA_ID = "katopu.editspec.v1"
+RESULT_SCHEMA_ID = "katopu.result.v1"
+RUNRECEIPT_SCHEMA_ID = "katopu.runreceipt.v1"
+BATCHRUN_SCHEMA_ID = "katopu.batchrun.v1"

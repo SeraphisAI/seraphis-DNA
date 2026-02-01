@@ -1,0 +1,552 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+import streamlit as st
+
+from katopu_core.sequence import sanitize_sequence
+from katopu_core.nlp import local_nl_to_edit
+from katopu_core.apply import local_apply
+from katopu_policy.evaluator import PolicyEvaluator
+from katopu_shared.ids import CONTRACT_VERSION, ENGINE_VERSION, RESULT_SCHEMA_ID
+
+
+# -----------------------------
+# Config
+# -----------------------------
+
+DEFAULT_API_BASE = os.getenv("KATOPU_API_BASE", "http://localhost:8000").rstrip("/")
+DEFAULT_TIMEOUT = float(os.getenv("KATOPU_HTTP_TIMEOUT", "8"))
+
+POLICY_BASE_PATH = os.getenv("KATOPU_POLICY_PATH", "/policies/default.policy.json")
+POLICY_OVERRIDE_PATH = os.getenv("KATOPU_POLICY_OVERRIDE_PATH", "/data/policy_override.json")
+POLICY_AUDIT_PATH = os.getenv("KATOPU_POLICY_AUDIT_PATH", "/data/policy_audit.log")
+TELEMETRY_PATH = os.getenv("KATOPU_TELEMETRY_PATH", "/data/telemetry.jsonl")
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def redact_seq(seq: str, head: int = 6, tail: int = 6) -> Dict[str, Any]:
+    seq = seq or ""
+    if len(seq) <= head + tail:
+        preview = seq
+    else:
+        preview = f"{seq[:head]}…{seq[-tail:]}"
+    return {"preview": preview, "len": len(seq), "sha256": sha256_hex(seq) if seq else None}
+
+
+def tail_lines(path: str, n: int = 200) -> str:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block = 4096
+            data = b""
+            while size > 0 and data.count(b"\n") <= n:
+                step = min(block, size)
+                size -= step
+                f.seek(size)
+                data = f.read(step) + data
+            text = data.decode("utf-8", errors="replace")
+            lines = text.splitlines()[-n:]
+            return "\n".join(lines)
+    except FileNotFoundError:
+        return "(dosya yok)"
+    except Exception as e:
+        return f"(okunamadı: {e})"
+
+
+@dataclass
+class RunResult:
+    ok: bool
+    source: str
+    result: Optional[Dict[str, Any]] = None
+    spec: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"Accept": "application/json"})
+    return s
+
+
+def api_headers(api_key: str) -> Dict[str, str]:
+    h: Dict[str, str] = {}
+    if api_key.strip():
+        h["X-API-Key"] = api_key.strip()
+    return h
+
+
+def api_post(session: requests.Session, api_base: str, path: str, payload: Dict[str, Any], timeout: float, api_key: str) -> Dict[str, Any]:
+    url = f"{api_base}{path}"
+    r = session.post(url, json=payload, headers=api_headers(api_key), timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_get(session: requests.Session, api_base: str, path: str, timeout: float, api_key: str) -> Dict[str, Any]:
+    url = f"{api_base}{path}"
+    r = session.get(url, headers=api_headers(api_key), timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def policy_active_path() -> Tuple[str, bool]:
+    """Return (path, is_override)."""
+    if os.path.exists(POLICY_OVERRIDE_PATH):
+        return POLICY_OVERRIDE_PATH, True
+    return POLICY_BASE_PATH, False
+
+
+def get_policy_evaluator() -> Tuple[PolicyEvaluator, str, bool]:
+    path, is_override = policy_active_path()
+    key = "_policy_cache"
+    cache = st.session_state.get(key)
+    mtime = os.path.getmtime(path) if os.path.exists(path) else 0
+
+    if cache is None or cache.get("path") != path or cache.get("mtime") != mtime:
+        pe = PolicyEvaluator(path)
+        st.session_state[key] = {"path": path, "mtime": mtime, "pe": pe, "override": is_override}
+    cache = st.session_state[key]
+    return cache["pe"], cache["path"], cache["override"]
+
+
+def local_spec(intent: str, mode: str) -> Dict[str, Any]:
+    # mode is kept for symmetry; local parser uses intent only.
+    _ = mode
+    intent_norm = intent.strip()
+    edit = local_nl_to_edit(intent_norm)
+    return {
+        "edit": edit,
+        "sequence": "(local)",
+        "mode": mode,
+        "intent_norm": intent_norm,
+    }
+
+
+def local_apply_with_policy(sequence: str, intent: str, mode: str) -> RunResult:
+    try:
+        seq = sanitize_sequence(sequence)
+    except Exception as e:
+        return RunResult(ok=False, source="local", error=f"sequence invalid: {e}")
+
+    pe, pol_path, pol_override = get_policy_evaluator()
+
+    def _ui_error_result(
+        before: str,
+        code: str,
+        detail: Dict[str, Any],
+        *,
+        policy_allowed: bool,
+        policy_reason: Optional[str],
+        edit_map: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Best-effort result.v1 payload for UI-side failures (keeps the UI stable)."""
+        return {
+            "schema": RESULT_SCHEMA_ID,
+            "before": before,
+            "after": before,
+            "edit_map": edit_map or {"text": "(ui)"},
+            "effect_label": "ERROR",
+            "metrics": {"delta_nt": 0},
+            "errors": [{"code": code, "detail": detail}],
+            "flags": [],
+            "_meta": {"source": "local", "engine": ENGINE_VERSION, "contract": CONTRACT_VERSION},
+            "_policy": {
+                "allowed": policy_allowed,
+                "reason": policy_reason,
+                "policy_path": pol_path,
+                "override": pol_override,
+            },
+        }
+
+    ok, reason = pe.check_sequence_len(seq)
+    if not ok:
+        return RunResult(
+            ok=False,
+            source="local",
+            error=f"policy blocked: {reason}",
+            result=_ui_error_result(seq, "POLICY_BLOCK", {"reason": reason}, policy_allowed=False, policy_reason=reason),
+        )
+
+    ok, reason, _ = pe.check_intent(intent)
+    if not ok:
+        return RunResult(
+            ok=False,
+            source="local",
+            error=f"policy blocked: {reason}",
+            result=_ui_error_result(seq, "POLICY_BLOCK", {"reason": reason}, policy_allowed=False, policy_reason=reason),
+        )
+
+    spec = local_spec(intent, mode)
+    op = (spec.get("edit") or {}).get("op")
+    ok, reason = pe.allow_op(op)
+    if not ok:
+        return RunResult(
+            ok=False,
+            source="local",
+            error=f"policy blocked: {reason}",
+            result=_ui_error_result(seq, "POLICY_BLOCK", {"reason": reason, "op": op}, policy_allowed=False, policy_reason=reason),
+            spec=spec,
+        )
+
+    edit_obj = spec.get("edit")
+    if not isinstance(edit_obj, dict):
+        return RunResult(
+            ok=False,
+            source="local",
+            error="intent unparsed",
+            result=_ui_error_result(seq, "INTENT_UNPARSED", {"intent": intent, "mode": mode}, policy_allowed=True, policy_reason=None),
+            spec=spec,
+        )
+
+    # FIX: katopu_core.apply.local_apply signature is (seq, mode, edit_obj)
+    result = local_apply(seq, mode, edit_obj)
+    if not isinstance(result, dict):
+        return RunResult(
+            ok=False,
+            source="local",
+            error="local apply failed",
+            result=_ui_error_result(seq, "APPLY_FAILED", {"intent": intent, "mode": mode}, policy_allowed=True, policy_reason=None),
+            spec=spec,
+        )
+
+    result.setdefault("_meta", {})
+    result["_meta"].update({"source": "local", "engine": ENGINE_VERSION, "contract": CONTRACT_VERSION})
+    result["_policy"] = {"allowed": True, "reason": None, "policy_path": pol_path, "override": pol_override}
+
+    return RunResult(ok=True, source="local", result=result, spec=spec)
+
+
+def run_chain(sequence: str, intent: str, mode: str, api_base: str, timeout: float, api_key: str, enable_local_fallback: bool) -> RunResult:
+    session = st.session_state.get("_http")
+    if session is None:
+        session = make_session()
+        st.session_state["_http"] = session
+
+    payload = {"intent": intent, "mode": mode}
+
+    # 1) Primary
+    try:
+        res = api_post(session, api_base, f"/run?sequence={sequence}", payload, timeout, api_key)
+        return RunResult(ok=True, source="api:/run", result=res)
+    except Exception as e:
+        err1 = str(e)
+
+    # 2) Bridge
+    try:
+        res = api_post(session, api_base, f"/v1/katopu/run?sequence={sequence}", payload, timeout, api_key)
+        return RunResult(ok=True, source="api:/v1/katopu/run", result=res)
+    except Exception as e:
+        err2 = str(e)
+
+    if not enable_local_fallback:
+        return RunResult(ok=False, source="api", error=f"API failed. /run: {err1} | /v1/katopu/run: {err2}")
+
+    # 3) Local
+    lr = local_apply_with_policy(sequence, intent, mode)
+    if lr.ok:
+        return lr
+    lr.error = f"API failed; local fallback also failed: {lr.error}"
+    return lr
+
+
+# -----------------------------
+# UI
+# -----------------------------
+
+st.set_page_config(page_title="Katopu GenLab (Ultra)", layout="wide")
+
+st.title("Katopu GenLab — Ultra UI (fallback + policy panel)")
+
+with st.sidebar:
+    st.subheader("Bağlantı")
+    api_base = st.text_input("API Base", value=st.session_state.get("api_base", DEFAULT_API_BASE))
+    api_key = st.text_input("API Key (opsiyonel)", value=st.session_state.get("api_key", ""), type="password")
+    timeout = st.number_input("HTTP Timeout (sn)", min_value=1.0, max_value=60.0, value=float(st.session_state.get("timeout", DEFAULT_TIMEOUT)), step=1.0)
+
+    enable_local_fallback = st.checkbox("API yoksa Local Fallback", value=bool(st.session_state.get("enable_local_fallback", True)))
+
+    st.session_state["api_base"] = api_base.rstrip("/")
+    st.session_state["api_key"] = api_key
+    st.session_state["timeout"] = timeout
+    st.session_state["enable_local_fallback"] = enable_local_fallback
+
+    if st.button("Sağlık kontrolü (/health)"):
+        session = st.session_state.get("_http") or make_session()
+        st.session_state["_http"] = session
+        try:
+            r = api_get(session, api_base.rstrip("/"), "/health", timeout, api_key)
+            st.success(r)
+        except Exception as e:
+            st.error(str(e))
+
+
+tab_lab, tab_batch, tab_policy, tab_telemetry, tab_diag = st.tabs([
+    "Lab",
+    "Batch",
+    "Policy",
+    "Telemetry",
+    "Diagnostics",
+])
+
+
+with tab_lab:
+    c1, c2 = st.columns([2, 1])
+
+    with c1:
+        sequence = st.text_area("DNA/RNA Sequence", value="ATGACCTTGGCTAACCTGTTACGATGGCCTTAA", height=120)
+        intent = st.text_input("Intent (TR serbest metin)", value="ilk 5 baz sil")
+
+    with c2:
+        mode = st.selectbox("Mode", ["strict", "lenient"], index=0)
+
+        run_btn = st.button("Tek Adım Çalıştır", type="primary")
+        spec_btn = st.button("Spec Üret")
+        apply_btn = st.button("Spec'i Uygula")
+
+    spec_store_key = "_spec_current"
+
+    if spec_btn:
+        # Try API spec first; fallback to local.
+        sess = st.session_state.get("_http") or make_session()
+        st.session_state["_http"] = sess
+        payload = {"sequence": sequence, "intent": intent, "mode": mode}
+        try:
+            spec = api_post(sess, api_base, "/nl/spec", payload, timeout, api_key)
+            st.session_state[spec_store_key] = spec
+            st.success("Spec üretildi (API)")
+        except Exception:
+            spec = local_spec(intent, mode)
+            st.session_state[spec_store_key] = spec
+            st.warning("API spec alınamadı; local spec üretildi")
+
+    if apply_btn:
+        spec = st.session_state.get(spec_store_key)
+        if not spec:
+            st.error("Önce Spec Üret")
+        else:
+            # Apply via API if possible, else local.
+            sess = st.session_state.get("_http") or make_session()
+            st.session_state["_http"] = sess
+            try:
+                payload = {"sequence": sequence, "mode": mode, "edit": spec.get("edit")}
+                res = api_post(sess, api_base, "/edit/apply", payload, timeout, api_key)
+                st.success("Uygulandı (API)")
+                st.json(res)
+            except Exception:
+                lr = local_apply_with_policy(sequence, intent, mode)
+                if lr.ok:
+                    st.success("Uygulandı (Local)")
+                    st.json(lr.result)
+                else:
+                    st.error(lr.error or "Local apply failed")
+                    if lr.result:
+                        st.json(lr.result)
+
+    if run_btn:
+        rr = run_chain(sequence, intent, mode, api_base, timeout, api_key, enable_local_fallback)
+        if rr.ok:
+            st.success(f"OK — source: {rr.source}")
+            st.json(rr.result)
+        else:
+            st.error(rr.error or "Run failed")
+            if rr.result:
+                st.json(rr.result)
+
+    spec = st.session_state.get(spec_store_key)
+    if spec:
+        st.subheader("Current Spec")
+        st.json(spec)
+
+
+with tab_batch:
+    st.caption("Batch çalıştırma: Her satır (sequence\tintent) veya (sequence,intent) formatında.")
+
+    default_batch = "ATGC\tilk 2 baz sil\nATGACCTTGGCTAACCTGTTACGATGGCCTTAA\tilk 5 baz sil"
+    batch_text = st.text_area("Batch input", value=st.session_state.get("batch_text", default_batch), height=160)
+    st.session_state["batch_text"] = batch_text
+
+    mode_b = st.selectbox("Mode (batch)", ["strict", "lenient"], index=0, key="mode_batch")
+
+    colA, colB, colC = st.columns([1, 1, 2])
+
+    with colA:
+        go = st.button("Batch Çalıştır", type="primary")
+    with colB:
+        redact_export = st.checkbox("Export redacted (default)", value=True)
+    with colC:
+        st.write("Export: redacted = sequence preview + sha256 (tam dizi yok)")
+
+    def parse_lines(txt: str) -> List[Tuple[str, str]]:
+        out: List[Tuple[str, str]] = []
+        for raw in txt.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if "\t" in line:
+                a, b = line.split("\t", 1)
+            elif "," in line:
+                a, b = line.split(",", 1)
+            else:
+                out.append((line, ""))
+                continue
+            out.append((a.strip(), b.strip()))
+        return out
+
+    if go:
+        rows = parse_lines(batch_text)
+        results: List[Dict[str, Any]] = []
+        for seq, it in rows:
+            rr = run_chain(seq, it, mode_b, api_base, timeout, api_key, enable_local_fallback)
+            item: Dict[str, Any] = {
+                "ok": rr.ok,
+                "source": rr.source,
+                "sequence": seq,
+                "intent": it,
+                "error": rr.error,
+                "result": rr.result,
+            }
+            results.append(item)
+
+        st.session_state["batch_results"] = results
+        st.success(f"Bitti: {len(results)}")
+
+    results = st.session_state.get("batch_results")
+    if results:
+        st.subheader("Results")
+        st.json(results)
+
+        export_obj: Dict[str, Any]
+        if redact_export:
+            export_rows: List[Dict[str, Any]] = []
+            for r in results:
+                rr = r.get("result") or {}
+                before = rr.get("before") or ""
+                after = rr.get("after") or ""
+                export_rows.append({
+                    "ok": r.get("ok"),
+                    "source": r.get("source"),
+                    "intent": r.get("intent"),
+                    "before": redact_seq(before),
+                    "after": redact_seq(after),
+                    "effect_label": rr.get("effect_label"),
+                    "edit_map": rr.get("edit_map"),
+                    "metrics": rr.get("metrics"),
+                    "_policy": rr.get("_policy"),
+                    "_meta": rr.get("_meta"),
+                    "error": r.get("error"),
+                })
+            export_obj = {"schema": "katopu.batch.export.redacted.v1", "rows": export_rows}
+        else:
+            export_obj = {"schema": "katopu.batch.export.full.v1", "rows": results}
+
+        st.download_button(
+            label="Download batch.json",
+            data=json.dumps(export_obj, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="katopu_batch.json",
+            mime="application/json",
+        )
+
+
+with tab_policy:
+    st.subheader("Policy Panel")
+
+    base_path = POLICY_BASE_PATH
+    active_path, is_override = policy_active_path()
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.caption(f"Base policy: {base_path}")
+        st.code(tail_lines(base_path, n=200) if os.path.exists(base_path) else "(base policy yok)")
+
+    with c2:
+        st.caption(f"Active policy: {active_path} ({'override' if is_override else 'base'})")
+        active_txt = ""
+        if os.path.exists(active_path):
+            active_txt = open(active_path, "r", encoding="utf-8").read()
+        else:
+            active_txt = "{}"
+
+        edited = st.text_area("Override editor (JSON)", value=active_txt, height=220)
+
+        colX, colY, colZ = st.columns([1, 1, 2])
+        with colX:
+            if st.button("Override kaydet"):
+                try:
+                    obj = json.loads(edited)
+                    if not isinstance(obj, dict):
+                        raise ValueError("policy must be an object")
+                    # Write override
+                    os.makedirs(os.path.dirname(POLICY_OVERRIDE_PATH), exist_ok=True)
+                    with open(POLICY_OVERRIDE_PATH, "w", encoding="utf-8") as f:
+                        json.dump(obj, f, ensure_ascii=False, indent=2)
+                    st.success(f"Yazıldı: {POLICY_OVERRIDE_PATH}")
+                except Exception as e:
+                    st.error(str(e))
+
+        with colY:
+            if st.button("Override sıfırla"):
+                try:
+                    if os.path.exists(POLICY_OVERRIDE_PATH):
+                        os.remove(POLICY_OVERRIDE_PATH)
+                    st.success("Override kaldırıldı")
+                except Exception as e:
+                    st.error(str(e))
+
+        with colZ:
+            st.caption("Not: Override yazınca API otomatik olarak override policy'yi yükler (container restart gerekmez).")
+
+    st.markdown("---")
+    st.caption(f"Policy audit tail: {POLICY_AUDIT_PATH}")
+    st.code(tail_lines(POLICY_AUDIT_PATH, n=120))
+
+
+with tab_telemetry:
+    st.subheader("Telemetry")
+    st.caption("Telemetry default kapalıdır. Açmak için infra/.env içinde KATOPU_TELEMETRY_ENABLED=true yap.")
+    st.caption(f"Telemetry tail: {TELEMETRY_PATH}")
+    st.code(tail_lines(TELEMETRY_PATH, n=120))
+
+
+with tab_diag:
+    st.subheader("Diagnostics")
+    st.write("**UI**: http://localhost:8501")
+    st.write("**API**: http://localhost:8000")
+    st.write("**Swagger**: http://localhost:8000/docs")
+
+    st.markdown("### PowerShell hızlı komutlar")
+    st.code(
+        """
+# Proje klasörüne gir
+cd "C:\\Users\\LENOVO\\Desktop\\katopu_genlab_ultra_v2\\infra"
+
+# Başlat / güncelle
+ docker compose up -d --build
+
+# Durum
+ docker ps --format "table {{.Names}}\t{{.Ports}}\t{{.Status}}"
+
+# Loglar
+ docker compose logs -f api
+ docker compose logs -f ui
+
+# Durdur
+ docker compose down
+""".strip(),
+        language="powershell",
+    )
