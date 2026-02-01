@@ -1,0 +1,21 @@
+{
+  "version": "0.1.0",
+  "rules": {
+    "max_sequence_len": 200000,
+    "max_insert_len": 100000,
+    "allow_ops": [
+      "deletion",
+      "prefix_deletion",
+      "suffix_deletion",
+      "insertion",
+      "substitution",
+      "conditional_substitution",
+      "point_mutation"
+    ],
+    "deny_intent_regex": [
+      "(?i)weapon|bioweapon|anthrax|smallpox|variola|pathogen|gain\\s*of\\s*function",
+      "(?i)how\\s+to\\s+make\\s+.*virus|create\\s+virus|engineer\\s+pathogen"
+    ],
+    "redact_sequences_in_logs": true
+  }
+}

@@ -1,0 +1,50 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    environment:
+      - KATOPU_POLICY_PATH=/policies/default.policy.json
+      - KATOPU_POLICY_OVERRIDE_PATH=${KATOPU_POLICY_OVERRIDE_PATH:-/data/policy_override.json}
+      - KATOPU_POLICY_MUTABLE=${KATOPU_POLICY_MUTABLE:-false}
+      - KATOPU_TELEMETRY_ENABLED=${KATOPU_TELEMETRY_ENABLED:-false}
+      - KATOPU_TELEMETRY_SAMPLE_RATE=${KATOPU_TELEMETRY_SAMPLE_RATE:-0.1}
+      - KATOPU_TELEMETRY_PATH=${KATOPU_TELEMETRY_PATH:-/data/telemetry.jsonl}
+      - KATOPU_POLICY_AUDIT_PATH=${KATOPU_POLICY_AUDIT_PATH:-/data/policy_audit.jsonl}
+      - KATOPU_API_KEY=${KATOPU_API_KEY:-}
+      - KATOPU_RATE_RPS=${KATOPU_RATE_RPS:-5}
+      - KATOPU_RATE_BURST=${KATOPU_RATE_BURST:-10}
+    volumes:
+      - ../policy/policies:/policies:ro
+      - katopu-data:/data
+    ports:
+      - "${KATOPU_API_PORT:-8000}:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/health').read())"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ui:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.ui
+    environment:
+      - KATOPU_API_BASE=${KATOPU_API_BASE:-http://api:8000}
+      - KATOPU_API_KEY=${KATOPU_API_KEY:-}
+      - KATOPU_POLICY_PATH=/policies/default.policy.json
+      - KATOPU_POLICY_OVERRIDE_PATH=${KATOPU_POLICY_OVERRIDE_PATH:-/data/policy_override.json}
+      - KATOPU_POLICY_AUDIT_PATH=${KATOPU_POLICY_AUDIT_PATH:-/data/policy_audit.jsonl}
+    volumes:
+      - ../policy/policies:/policies:ro
+      - katopu-data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${KATOPU_UI_PORT:-8501}:8501"
+    restart: unless-stopped
+
+volumes:
+  katopu-data:

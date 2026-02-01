@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+WORKDIR /ui
+
+COPY pyproject.toml README.md /ui/
+COPY src /ui/src
+COPY ui /ui/ui
+
+RUN pip install --no-cache-dir -e /ui
+RUN pip install --no-cache-dir -r /ui/ui/requirements.txt
+
+EXPOSE 8501
+CMD ["streamlit","run","/ui/ui/app.py","--server.address","0.0.0.0","--server.port","8501"]
